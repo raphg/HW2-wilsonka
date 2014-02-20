@@ -1,0 +1,174 @@
+Homework 2
+========================================================
+
+The goal of this assignment is to reproduce the results presented in Figure 2 of the following paper: 
+Qian, F., Bolen, C. R., Jing, C., Wang, X., Zheng, W., Zhao, H., et al. (2013). Impaired toll-like receptor 3-mediated immune responses from macrophages of patients chronically infected with hepatitis C virus. Clinical and Vaccine Immunology : CVI, 20(2), 146–155. doi:10.1128/CVI.00530-12
+
+First we load the necessary libraries (and install required packages):
+
+```{r message=FALSE}
+library(GEOmetadb)
+library(limma)
+library(pheatmap)
+```
+
+Download Data & Clean/Normalize:
+================================
+Next, we download the necessary data. This will store the file in the working directory under Data/GEO. You may have to make the directory first.
+
+```{r}
+#gds <- getGEO("GSE40812", destdir = "./Data/GEO/")
+gds <- getGEO(filename = "./Data/GEO/GSE40812_series_matrix.txt.gz")
+```
+
+I believe the data is normalized, but if not-- I believe we would do something like the following:
+
+```{r}
+#library(lumi)
+#gds <- lumiN(gds)
+```
+
+Now, we clean and organize the data. Note that we only want the "Macrophage" data (not PBMC).
+
+```{r}
+pd <- pData(gds)
+mmpd <- pd[pd$source_name_ch1=="Monocyte-derived Macrophage",]
+mmeset <- gds[,rownames(mmpd)]
+```
+
+This leaves us with our 40 samples (20 subjects each with a Mock and poly (I-C) sample). I do some more data cleaning (stripping out subject ID code).
+```{r}
+mmpd$subj <- substring(gsub("^[A-Z][A-Z][0-9]+_","",mmpd[,'title']),1,4)
+
+mmpd$HCV <- gsub(".*: ", "", mmpd$characteristics_ch1)
+mmpd$HCV <- factor(ifelse(mmpd$HCV =="Neg", 1, 2))
+
+mmpd$treatment <- tolower(gsub(".*: ","", mmpd$characteristics_ch1.2))
+mmpd$treatment <- factor(ifelse(mmpd$treatment == "mock",1,2))
+```
+
+Getting the 1,146 Differentially Expressed Probes
+=================================================
+
+Now that we have the data in the right format, we need the model matrix and the linear model fit. We focus on finding the probes (and genes) that are differentially expressed between the "treatment" groups. For this analysis, we don't differentiate between subjects. Finally, we get the empirical Bayes Statistics for DE.
+Next, we use the cutoffs supplied in the paper: FDR cutoff of 0.05 and a fold change of > 1.5 to identify which probes are differentially expressed.
+
+```{r}
+mm_tx <- model.matrix(~treatment,mmpd)
+fit_tx <- lmFit(exprs(mmeset), mm_tx)
+ebay_tx <- eBayes(fit_tx)
+tt_tx <- topTable(ebay_tx, coef="treatment2", number=Inf)
+probes_tx <- tt_tx[tt_tx$adj.P.Val < 0.05 & abs(tt_tx$logFC)>log2(1.5), ]
+nrow(probes_tx)
+```
+
+The variable "probes_tx"" contains the 1,146 differentially expressed probes that the paper identified.
+
+Compute Fold Change for each Subject
+====================================
+
+Next, the paper says "fold changes were calculated between each subject’s paired mock and poly(I·C) sample".
+
+First, I retrieve the data. This includes the subject id, geo accession number, treatment (Poly IC=2, Mock=1). I also get the HCV (pos=2, neg=1)-- to be used later. I also get the expression set for the 1,146 differentially expressed probes that we identified above.
+
+```{r}
+subj_info <- mmpd[,c('geo_accession','subj','treatment','HCV')]
+exprs.probes_tx <- exprs(mmeset)[rownames(probes_tx),]
+```
+
+Next, I get the mock and poly geo_accession numbers for each subject. Ultimately, I want to create a data frame that has the subject ID as well as the mock and poly geo accession numbers. Note that each subject has 2 geo numbers (1 for mock and 1 for poly).
+
+```{r}
+mock <- subj_info[subj_info$treatment==1,]
+mock$mock_geo <- mock$geo_accession
+mock.ordered <- mock[order(mock$subj),]
+poly <- subj_info[subj_info$treatment==2,]
+poly$poly_geo <- poly$geo_accession
+poly.ordered <- poly[order(poly$subj),]
+
+pm_data <- cbind(poly.ordered,mock.ordered)
+pm_data <- pm_data[c('subj','mock_geo','poly_geo')]
+```
+The pm_data contains the subject id and the 2 geo numbers.
+
+I create a function that creates a new column in the expression set data for each subject. It subtracts the Poly level from the Mock level.
+
+```{r}
+fold_change <- function(data, sid, mock_geo, poly_geo){
+  data[[sid]] <- data[[mock_geo]] - data[[poly_geo]]
+  return(data)
+}
+
+exprs.probes_tx.df <- as.data.frame(exprs.probes_tx)
+
+for(i in 1:nrow(pm_data)){
+  row <- pm_data[i,]
+  exprs.probes_tx.df <- fold_change(exprs.probes_tx.df,sid = row[,1], mock_geo = row[,2], poly_geo = row[,3])
+}
+
+exprs.probes_tx.diff <- exprs.probes_tx.df[,41:60] #The first 40 are the GEO #s and the last 20 correspond to the subjects fold change from Mock to Poly.
+```
+
+The "exprs.probes_tx.diff"" contains the 1,146 differentially expressed probes in each row. Then, the 20 columns have the "fold change" (Mock-Poly) for each subject id.
+
+Identifying the final 43 probes
+===============================
+
+Next, we get to work creating the design matrix, this time comparing fold changes between positive and negative subjects (based off the "exprs.probes_tx.diff" expression data)
+
+```{r}
+subj_info.ordered <- unique(subj_info[,c('subj','HCV')])
+subj_info.ordered <- subj_info.ordered[order(subj_info.ordered$subj),] #The expression data is ordered by subject ID
+mm_np <- model.matrix(~HCV,subj_info.ordered)
+```
+
+Next we get the linear model fit. We focus on finding the probes (and genes) that are differentially expressed between the "HCV" groups. We get the empirical Bayes Statistics for DE. We use the cutoffs supplied in the paper: P-value less than 0.1 to get the 43 probes for the figure.
+
+```{r}
+fit_np <- lmFit(exprs.probes_tx.diff, mm_np)
+ebay_np <- eBayes(fit_np)
+tt_np <- topTable(ebay_np, coef="HCV2", number=Inf)
+
+figure_probes <- tt_np[tt_np$P.Value < 0.1,]
+figure_probes <- rownames(figure_probes)
+length(figure_probes)
+```
+
+Creating Figure 2
+=================
+
+The authors create z-scores for each geo_accession for each probe.
+
+```{r}
+figure_probes.exprs <- exprs.probes_tx[figure_probes,]
+
+z_scores <- function(row){
+  row <- t(as.matrix(row))
+  xbar <- mean(row)
+  sdev <- sd(row) #Do not divide by sqrt(n)?
+  z_scores <- rep(0,ncol(row))
+  for(i in 1:ncol(row)){
+    z_scores[i] <- (row[i]-xbar)/sdev
+  }
+  return(z_scores)
+}
+
+z <- rep(0,40)
+for(i in 1:nrow(figure_probes.exprs)){
+  z <- rbind(z,z_scores(figure_probes.exprs[i,]))
+}
+z <- z[-1,]
+colnames(z) <- subj_info$geo_accession
+```
+
+Finally, we are ready to create the heatmap. I reorder the data to get it to appear like it does in the article. I wasn't sure how to clearly differentiate between Mock/Poly IC and pos/neg.
+```{r}
+ordered <- subj_info[order(subj_info$HCV,subj_info$treatment,subj_info$subj),]
+
+tmp <- subj_info[order(subj_info$treatment,subj_info$HCV,subj_info$subj),]
+myorder <- as.vector(tmp$geo_accession)
+z <- z[,myorder]
+colnames(z) <- tmp$subj
+
+pheatmap(z, cluster_rows=F, cluster_cols=F)
+```
